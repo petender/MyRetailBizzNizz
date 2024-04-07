@@ -1,0 +1,60 @@
+#NAME THE PIPELINE SAME AS FILE (WITHOUT ".yml")
+# trigger:
+# - main
+
+resources:
+  repositories:
+    - repository: self
+      trigger: none
+
+stages:
+
+- stage: Build
+  dependsOn:
+  variables:
+    dotnetSdkVersion: "6.0.x"
+    buildConfiguration: "Release"
+  displayName: Build .Net Core Solution
+  jobs:
+  - job: build_dotnet
+    displayName: build the dotnet functions
+    steps:
+      - checkout: self
+
+      - task: AdvancedSecurity-Codeql-Init@1
+        inputs:
+          languages: "csharp"
+      - task: UseDotNet@2
+        displayName: "Use .NET SDK $(dotnetSdkVersion)"
+        inputs:
+          version: "$(dotnetSdkVersion)"
+
+      - task: DotNetCoreCLI@2
+        displayName: "Restore project dependencies"
+        inputs:
+          command: "restore"
+          projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+
+      - task: DotNetCoreCLI@2
+        displayName: "Build the project - $(buildConfiguration)"
+        inputs:
+          command: "build"
+          arguments: "--no-restore --configuration $(buildConfiguration)"
+          projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+
+      - task: DotNetCoreCLI@2
+        displayName: "Publish the project - $(buildConfiguration)"
+        inputs:
+          command: "publish"
+          projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+          publishWebProjects: false
+          arguments: "--no-build --configuration $(buildConfiguration) --output $(dotnetFunctionZipPath)"
+          zipAfterPublish: true
+
+      - publish: $(dotnetFunctionZipPath)
+        artifact: dotnet
+
+      - task: AdvancedSecurity-Dependency-Scanning@1
+
+
+      - task: AdvancedSecurity-Codeql-Analyze@1

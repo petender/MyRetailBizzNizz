@@ -1,0 +1,205 @@
+name: $(BuildDefinitionName)_$(date:yyyyMMdd)$(rev:.r)-$(RunName)
+
+trigger: none
+
+pr: none
+
+parameters:
+  - name: Alias
+    type: string
+    default: petender
+  - name: azureSubscription
+    type: string
+    default: azureSubscription
+  - name: Location
+    type: string
+    default: eastus
+
+variables:
+  - name: RunName
+    value: "${{parameters.Alias}}"
+  - name: RGName 
+    value: "RG-TOLLBOOTH"
+  - name: dotnetFunctionZipPath
+    value: $(Build.ArtifactStagingDirectory)/dotnet
+  - name: nodeFunctionZipPath
+    value: $(Build.ArtifactStagingDirectory)/node
+  - name: pipelineName
+    value: $(Build.DefinitionName)
+
+stages:
+  - stage: Infra
+    jobs:
+      - job: Bicep
+        steps:
+          - checkout: self
+          - task: PowerShell@2
+            displayName: 'Generate Random String for Naming Resources'
+            
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Your PowerShell script here
+                
+                #generate random string for naming resources using lowercase and digits only
+                do {
+                $randomName = -join ((97..122) + (48..57) | Get-Random -Count 12 | % {[char]$_})
+                } while ($randomName -notmatch '^[a-zA-Z][a-zA-Z0-9-]{6,50}[a-zA-Z0-9]$')
+
+                Write-Host "##vso[task.setvariable variable=genrandom;]$randomName"
+                Write-Host $genrandom
+
+
+          - task: AzureCLI@2
+            name: deployBicep
+            inputs:
+              azureSubscription: ${{ parameters.azureSubscription }}
+              scriptType: "pscore"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                az group create --location ${{parameters.Location}} --name $(RGName)
+                $out = $(az deployment group create -f ./infra/tollbooth/main.bicep -g $(RGName) --parameters namingConvention=tb$(genrandom) location=${{parameters.Location}} -o json --query properties.outputs) | ConvertFrom-Json
+                $out.PSObject.Properties | ForEach-Object {
+                  $keyname = $_.Name
+                  $value = $_.Value.value
+                  echo "##vso[task.setvariable variable=$keyname;isOutput=true]$value"
+                }
+  
+  - stage: BuildDotNet
+    dependsOn:
+    variables:
+      dotnetSdkVersion: "6.0.x"
+      buildConfiguration: "Release"
+    jobs:
+      - job: build_dotnet
+        displayName: build the dotnet functions
+        steps:
+          - checkout: self
+
+          - task: UseDotNet@2
+            displayName: "Use .NET SDK $(dotnetSdkVersion)"
+            inputs:
+              version: "$(dotnetSdkVersion)"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Restore project dependencies"
+            inputs:
+              command: "restore"
+              projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Build the project - $(buildConfiguration)"
+            inputs:
+              command: "build"
+              arguments: "--no-restore --configuration $(buildConfiguration)"
+              projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+
+          - task: DotNetCoreCLI@2
+            displayName: "Publish the project - $(buildConfiguration)"
+            inputs:
+              command: "publish"
+              projects: "src/MyRetailBizzNizz-Tollbooth/**/*.csproj"
+              publishWebProjects: false
+              arguments: "--no-build --configuration $(buildConfiguration) --output $(dotnetFunctionZipPath)"
+              zipAfterPublish: true
+
+          - publish: $(dotnetFunctionZipPath)
+            artifact: dotnet
+  
+  - stage: BuildNode
+    dependsOn:
+    variables:
+      nodePath: "./src/MyRetailBizzNizz-Tollbooth/FastCarDev.SavePlateDataFunction"
+      nodeZipName: "savePlateDataFunction.zip"
+    jobs:
+      - job: build_node
+        displayName: build the node functions
+        pool:
+          vmImage: "ubuntu-latest"
+          demands:
+            - npm
+        steps:
+          - checkout: self
+
+          - task: Npm@1
+            displayName: "Run npm install"
+            inputs:
+              workingDir: $(nodePath)
+              verbose: false
+
+          - task: ArchiveFiles@2
+            displayName: "Archive files"
+            inputs:
+              rootFolderOrFile: "$(System.DefaultWorkingDirectory)/$(nodePath)"
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(nodeFunctionZipPath)/$(nodeZipName)
+              replaceExistingArchive: true
+
+          - upload: $(nodeFunctionZipPath)/$(nodeZipName)
+            artifact: node
+  
+  - stage: DeployCode
+    displayName: Deploy code
+    dependsOn: [Infra, BuildDotNet, BuildNode]
+    condition: succeeded()
+    variables:
+      processImageFnName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.ProcessImageFnName']]
+      savePlateFnName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.SavePlateFnName']]
+      imageUploadAppName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.UploadImageWebAppName']]
+    jobs:
+      - deployment: Deploy
+        environment: Demo
+        displayName: Deploy
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: AzureFunctionApp@2
+                  displayName: "Azure Function Deploy: ProcessImage"
+                  inputs:
+                    connectedServiceNameARM: ${{ parameters.azureSubscription }}
+                    appType: functionApp
+                    appName: $(processImageFnName)
+                    package: "$(Pipeline.Workspace)/dotnet/TollBooth.zip"
+
+                - task: AzureWebApp@1
+                  displayName: "Azure Web App: Upload Image"
+                  inputs:
+                    azureSubscription: ${{ parameters.azureSubscription }}
+                    appType: webAppLinux
+                    appName: $(imageUploadAppName)
+                    package: "$(Pipeline.Workspace)/dotnet/FastCarDev.UploadImage.zip"
+
+                - task: AzureFunctionApp@2
+                  displayName: "Azure Function Deploy: SavePlateData"
+                  inputs:
+                    connectedServiceNameARM: ${{ parameters.azureSubscription }}
+                    appType: functionApp
+                    appName: $(savePlateFnName)
+                    package: "$(Pipeline.Workspace)/node/*.zip"
+  
+  - stage: EventSubs
+    dependsOn: [Infra, DeployCode]
+    jobs:
+      - job: Bicep
+        variables:
+          processImageFnName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.ProcessImageFnName']]
+          savePlateFnName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.SavePlateFnName']]
+          eventGridTopicName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.EventGridTopicName']]
+          dataLakeAccountName: $[stageDependencies.Infra.Bicep.outputs['deployBicep.StorageAccName']]
+        steps:
+          - checkout: self
+          - task: AzureCLI@2
+            name: deployBicep
+            inputs:
+              azureSubscription: ${{ parameters.azureSubscription }}
+              scriptType: "pscore"
+              scriptLocation: "inlineScript"
+              inlineScript: |
+                echo $(processImageFnName)
+                $key = az functionapp keys list -g $(RGName) -n $(processImageFnName) --query systemKeys.blobs_extension --output tsv
+                az deployment group create -f ./infra/tollbooth/eventgridsub.bicep -g $(RGName) `
+                  --parameters dataLakeAccountName=$(dataLakeAccountName) processImageFnName=$(processImageFnName) `
+                    eventGridTopicName=$(eventGridTopicName) savePlateFnName=$(savePlateFnName) `
+                    blobExtensionKey=$key
